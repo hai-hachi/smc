@@ -1,8 +1,8 @@
 """SMC differential-drive kinematic comparison laboratory.
 
 Physical actuator clamps are used; no sign() or sat() switching term appears
-in any SMC control law. Nominal closest-point lookahead velocities are not
-true derivatives of the robot-dependent target; see README.
+in any SMC control law. The PP-circle carrot is robot-dependent, so
+nominal feedforward does not represent its actual derivatives; see README.
 """
 from __future__ import annotations
 from dataclasses import dataclass, replace
@@ -35,7 +35,6 @@ def clip(x, a, b):
 @dataclass
 class Config:
     path: str = 'smooth'
-    reference_mode: str = 'pp_circle'
     dx0: float = 0.0
     dy0: float = 2.0
     dtheta_deg: float = 0.0
@@ -48,10 +47,9 @@ class Config:
     replan_offset: float = 0.75  # metres, peak lateral path deformation
     length: float = 14.0
     circle_radius: float = 2.0
-    zigzag_angle_deg: float = 75.0
+    zigzag_angle_deg: float = 90.0
     zigzag_leg: float = 2.5
     zigzag_turns: int = 5
-    zigzag_radius: float = 0.35
     smooth_radius_min: float = 0.9
     smooth_radius_max: float = 4.0
     smooth_period: float = 6.0
@@ -74,9 +72,9 @@ class Config:
     singular_guard: float = 0.06
 
     def validate(self):
-        if self.path not in PATHS or self.reference_mode not in ('trajectory','closest_lookahead','pp_circle'):
+        if self.path not in PATHS:
             raise ValueError('Invalid path or reference mode')
-        for name in ('duration','dt','length','circle_radius','zigzag_leg','zigzag_radius',
+        for name in ('duration','dt','length','circle_radius','zigzag_leg',
                      'smooth_radius_min','smooth_radius_max','smooth_period','lambda_y',
                      'k_s','k_x','k_rho','curvature_window','v_max','w_max','a_max','alpha_max','singular_guard'):
             if getattr(self, name) <= 0:
@@ -100,6 +98,7 @@ class Path:
     theta: np.ndarray
     kappa: np.ndarray
     closed: bool = False
+    sharp_corners: bool = False
 
     @property
     def length(self):
@@ -112,8 +111,15 @@ class Path:
         else:
             laps = 0
             d = clip(distance, 0.0, self.length)
+        # For a sharp polyline the path tangent jumps at each vertex.
+        # Never interpolate the heading across an incoming straight leg.
+        if self.sharp_corners:
+            idx = min(int(np.searchsorted(self.s, d + 1e-10, side='right') - 1), len(self.s) - 1)
+            heading = float(self.theta[max(idx, 0)])
+        else:
+            heading = float(np.interp(d, self.s, self.theta))
         return (float(np.interp(d,self.s,self.x)), float(np.interp(d,self.s,self.y)),
-                float(np.interp(d,self.s,self.theta)) + (2*math.pi*laps if self.closed else 0.0),
+                heading + (2*math.pi*laps if self.closed else 0.0),
                 float(np.interp(d,self.s,self.kappa)))
 
     def project(self, x, y):
@@ -152,35 +158,27 @@ def make_path(c: Config, ds=0.04):
             x[j]=x[j-1]+step*math.cos(mid)
             y[j]=y[j-1]+step*math.sin(mid)
         return Path(s,x,y,th,k)
-    # Piecewise straight with constant-radius fillets. Angle changes heading, not
-    # the interior angle at the vertex. Curvature is discontinuous at joins.
-    pts=[[0.,0.,0.,0.,0.]]
-    def straight(length):
-        count=max(1,math.ceil(length/ds))
+    # Sharp-cornered polyline: ALL segments straight, no circular fillets.
+    # The user-selected angle is a heading change, not a rounded radius.
+    # Exact vertex curvature is undefined; the PP carrot estimates an
+    # effective curvature over its finite three-point sampling window.
+    points = [[0., 0., 0., 0., 0.]]
+    beta = math.radians(c.zigzag_angle_deg)
+    headings = (0., beta, 0., -beta)
+    count = max(1, math.ceil(c.zigzag_leg / ds))
+    for leg in range(c.zigzag_turns + 1):
+        heading = headings[leg % 4]
+        # Store the outgoing tangent at this vertex; no duplicate distance.
+        points[-1][3] = heading
         for _ in range(count):
-            ss,x,y,th,_=pts[-1]
-            step=length/count
-            pts.append([ss+step,x+step*math.cos(th),y+step*math.sin(th),th,0.])
-    def turn(delta):
-        if abs(delta)<1e-10: return
-        k=math.copysign(1/c.zigzag_radius,delta)
-        length=abs(delta)*c.zigzag_radius
-        count=max(2,math.ceil(length/ds))
-        for _ in range(count):
-            ss,x,y,th,_=pts[-1]
-            step=length/count
-            next_th=th+k*step
-            pts.append([ss+step,x+(math.sin(next_th)-math.sin(th))/k,
-                        y+(math.cos(th)-math.cos(next_th))/k,next_th,k])
-    straight(c.zigzag_leg)
-    beta=math.radians(c.zigzag_angle_deg)
-    targets=(beta,0.,-beta,0.)
-    for i in range(c.zigzag_turns):
-        turn(targets[i%4]-pts[-1][3]);straight(c.zigzag_leg)
-    arr=np.asarray(pts)
-    return Path(arr[:,0],arr[:,1],arr[:,2],arr[:,3],arr[:,4])
-
-
+            ss, x, y, _, _ = points[-1]
+            step = c.zigzag_leg / count
+            points.append([ss + step,
+                           x + step * math.cos(heading),
+                           y + step * math.sin(heading), heading, 0.])
+    arr = np.asarray(points)
+    return Path(arr[:,0], arr[:,1], arr[:,2], arr[:,3], arr[:,4],
+                sharp_corners=True)
 
 
 def make_replanned_path(original: Path, lateral_offset: float) -> Path:
@@ -192,8 +190,13 @@ def make_replanned_path(original: Path, lateral_offset: float) -> Path:
     """
     fraction = original.s / original.length
     lateral = lateral_offset * np.sin(math.pi * fraction) ** 2
-    xx = original.x - np.sin(original.theta) * lateral
-    yy = original.y + np.cos(original.theta) * lateral
+    # Use the geometric secant tangent, including at sharp vertices.
+    # This prevents a jump in the lateral offset when segment heading changes.
+    tx = np.gradient(original.x, original.s)
+    ty = np.gradient(original.y, original.s)
+    tangent = np.arctan2(ty, tx)
+    xx = original.x - np.sin(tangent) * lateral
+    yy = original.y + np.cos(tangent) * lateral
     ds = np.hypot(np.diff(xx), np.diff(yy))
     if np.any(ds < 1e-9):
         raise ValueError('Replan produced coincident samples')
@@ -306,30 +309,22 @@ def initial_pose(c,p):
 
 
 def reference(c, p, t, s_near, pose=None, carrot=None):
-    """Build nominal reference state; circle/arc lookahead is robot-dependent.
+    """PP-circle carrot with nominal speed and three-point curvature.
 
-    p can be replaced on every cycle when a Nav2 path is replanned. For
-    pp_circle, carrot is an optional precomputed (s, status) tuple.
+    The time argument is retained for compatibility with callers, but does
+    NOT advance the reference. A pose or a precomputed carrot is required.
     """
-    if c.reference_mode == 'trajectory':
-        s = c.v_ref * t
-    elif c.reference_mode == 'closest_lookahead':
-        s = s_near + c.lookahead
-    else:
-        if carrot is None:
-            if pose is None:
-                raise ValueError('pp_circle requires robot pose or precomputed carrot')
-            carrot = circle_carrot(p, float(pose[0]), float(pose[1]), c.lookahead, s_near)
-        s = carrot[0]
+    if carrot is None:
+        if pose is None:
+            raise ValueError('PP circle reference requires robot pose or precomputed carrot')
+        carrot = circle_carrot(p, float(pose[0]), float(pose[1]), c.lookahead, s_near)
+    s = carrot[0]
     if not p.closed:
         s = min(p.length, s)
-    x, y, th, k = p.sample(s)
-    if c.reference_mode == 'pp_circle':
-        th, k = sampled_curvature(p, s, c.curvature_window)
+    x, y = p.sample(s)[:2]
+    th, k = sampled_curvature(p, s, c.curvature_window)
     if p.closed:
         v = c.v_ref
-    elif c.reference_mode == 'trajectory':
-        v = c.v_ref if s < p.length-1e-8 else 0.0
     else:
         remaining = max(0., p.length - s_near)
         v = c.v_ref * (min(1., remaining / c.slowdown_dist) if c.slowdown_dist else 1.)
@@ -416,14 +411,12 @@ def simulate(c,method,p=None):
         if alternate is not None and t >= c.replan_time:
             active_path=alternate
         nearest,signed=active_path.project(float(pose[0]),float(pose[1]))
-        carrot = (circle_carrot(active_path, float(pose[0]), float(pose[1]),
-                                c.lookahead, nearest)
-                  if c.reference_mode == 'pp_circle' else None)
+        carrot = circle_carrot(active_path, float(pose[0]), float(pose[1]),
+                               c.lookahead, nearest)
         ref = reference(c, active_path, t, nearest, pose=pose, carrot=carrot)
-        k_ref = (sampled_curvature(active_path, ref[5], c.curvature_window)[1]
-                 if c.reference_mode == 'pp_circle' else active_path.sample(ref[5])[3])
+        k_ref = sampled_curvature(active_path, ref[5], c.curvature_window)[1]
         carrot_radial = math.hypot(ref[0] - pose[0], ref[1] - pose[1])
-        carrot_fallback = float(carrot is not None and carrot[1] != 'intersection')
+        carrot_fallback = float(carrot[1] != 'intersection')
         e=errors(pose,ref)
         try:
             v_des,w_des,s1,s2,den=control(c,method,ref,e)
@@ -475,10 +468,7 @@ def simulate(c,method,p=None):
         return Run(c,method,p,h,{'status':status,'path_rmse_m':math.nan},status)
     mask=h['t']>=c.warmup
     if not np.any(mask):mask=np.ones_like(h['t'],dtype=bool)
-    if c.reference_mode=='trajectory':
-        within=(np.hypot(h['ex'],h['ey'])<=c.settle_distance)&(np.abs(h['etheta'])<=math.radians(c.settle_heading_deg))
-    else:
-        within=(h['path_error']<=c.settle_distance)&(np.abs(h['path_heading_error'])<=math.radians(c.settle_heading_deg))
+    within=(h['path_error']<=c.settle_distance)&(np.abs(h['path_heading_error'])<=math.radians(c.settle_heading_deg))
     settle=_settle(h['t'],within,c.settle_hold)
     metrics=dict(status=status,
         path_rmse_m=float(np.sqrt(np.mean(h['path_error'][mask]**2))),
@@ -496,8 +486,7 @@ def simulate(c,method,p=None):
         elapsed_s=float(h['t'][-1]),
         replanned=bool(np.any(h['path_revision']>0)),
         carrot_fallback_pct=float(np.mean(h['carrot_fallback'])*100),
-        carrot_radius_rmse_m=float(np.sqrt(np.mean((h['carrot_radial_distance']-c.lookahead)**2)))
-          if c.reference_mode == 'pp_circle' else math.nan)
+        carrot_radius_rmse_m=float(np.sqrt(np.mean((h['carrot_radial_distance']-c.lookahead)**2))))
     return Run(c,method,p,h,metrics,status)
 
 
@@ -512,5 +501,5 @@ def batch(c,methods=CONTROLLERS,paths=PATHS,cases=CASES):
             for method in methods:
                 result=simulate(cc,method,p)
                 output.append({'path':name,'case':case,'controller':method,
-                               'reference_mode':cc.reference_mode,**result.metrics})
+                               **result.metrics})
     return output

@@ -19,11 +19,7 @@ st.caption('4 SMC laws × 4 start conditions × 4 paths · Python kinematic simu
 
 with st.sidebar:
     st.header('Experiment setup')
-    reference_mode=st.radio('Reference model',('pp_circle','closest_lookahead','trajectory'),
-        format_func=lambda x:{'pp_circle':'PP circle intersection (experimental)',
-                              'closest_lookahead':'Closest point + arc-length lookahead',
-                              'trajectory':'Time-based trajectory'}[x],
-        help='PP uses a radial circle from the robot; closest+arc uses distance along the path. Both are robot-dependent geometric targets.')
+    st.caption('Reference: PP circle intersection (only mode)')
     path=st.selectbox('Path',PATHS,index=3)
     case=st.selectbox('Starting pose',tuple(CASES)+('Custom',),index=1)
     default=CASES.get(case,(0.,0.,0.))
@@ -33,9 +29,9 @@ with st.sidebar:
     st.subheader('Reference and dynamics')
     speed=st.slider('Nominal reference speed (m/s)',0.0,1.0,0.40,0.01)
     lookahead=st.slider('Lookahead L (m)',0.0,3.0,0.60,0.05,
-        help='PP circle mode: radial robot-to-carrot distance. Closest-point mode: distance along path from projection.')
+        help='Euclidean radius of the robot-centered circle used to select the forward path intersection.')
     curvature_window=st.slider('3-point curvature half-window (m)',0.05,0.80,0.14,0.01,
-        help='PP mode only. Samples the path at carrot arc lengths s-h, s, s+h to calculate a signed circumcircle curvature. Smaller h is more local but more sensitive to sampled geometry.')
+        help='Samples the path at carrot arc lengths s-h, s, s+h to calculate a signed circumcircle curvature. Smaller h is more local but more sensitive to sampled geometry.')
     duration=st.slider('Duration (s)',5.,90.,30.,1.)
     with st.expander('Dynamic Nav2-style replanning demo',expanded=False):
         replan_enabled=st.checkbox('Replace path during the run',False,
@@ -61,10 +57,10 @@ with st.sidebar:
     with st.expander('Path geometry',expanded=True):
         length=st.slider('Path length (m)',4.,30.,14.,0.5)
         rad=st.slider('Circle radius (m)',0.3,8.,2.,0.1)
-        zz_ang=st.slider('Zigzag heading change (deg)',5.,165.,75.,5.)
+        zz_ang=st.slider('Zigzag heading change (deg)',5.,165.,90.,5.)
+        st.caption('Zigzag uses straight legs and sharp corners (no rounding).')
         zz_leg=st.slider('Zigzag leg length (m)',0.5,7.,2.5,0.25)
         zz_turns=st.slider('Zigzag turns',1,12,5)
-        zz_radius=st.slider('Zigzag fillet radius (m)',0.05,2.,0.35,0.05)
         smooth_min=st.slider('Smooth min local radius (m)',0.25,5.,0.9,0.05)
         smooth_max=st.slider('Smooth max local radius (m)',0.5,15.,4.,0.25)
         smooth_period=st.slider('Smooth curvature cycle length (m)',2.,20.,6.,0.5)
@@ -74,11 +70,10 @@ with st.sidebar:
         hold=st.slider('Required settle hold (s)',0.,5.,1.5,0.25)
         warmup=st.slider('RMSE warmup (s)',0.,15.,3.,0.5)
 
-cfg=Config(path=path,reference_mode=reference_mode,dx0=dx,dy0=dy,dtheta_deg=dth,
+cfg=Config(path=path,dx0=dx,dy0=dy,dtheta_deg=dth,
     duration=duration,dt=dt,v_ref=speed,lookahead=lookahead,curvature_window=curvature_window,replan_time=(replan_time if replan_enabled else 0.),
     replan_offset=replan_offset,length=length,
-    circle_radius=rad,zigzag_angle_deg=zz_ang,zigzag_leg=zz_leg,zigzag_turns=zz_turns,
-    zigzag_radius=zz_radius,smooth_radius_min=smooth_min,smooth_radius_max=smooth_max,
+    circle_radius=rad,zigzag_angle_deg=zz_ang,zigzag_leg=zz_leg,zigzag_turns=zz_turns,smooth_radius_min=smooth_min,smooth_radius_max=smooth_max,
     smooth_period=smooth_period,lambda_y=ly,lambda_x=lx,k_s=ks,k_x=kx,k_rho=krho,
     heading_stop_deg=stop,v_max=vmax,w_max=wmax,a_max=amax,alpha_max=alpha,
     allow_reverse=reverse,slowdown_dist=slowdown,settle_distance=settle_d,
@@ -91,15 +86,8 @@ except ValueError as exc:
 st.info('The **truncated** laws deliberately use ωR = 0 and omit the 1 + λy ex denominator. '
     'The **full** laws include ωR = vR κ and the nonlinear denominator; singularities are reported, not hidden. '
     '**None of the four includes an SMC saturation or sign switching term.** Physical speed clamps remain.')
-if reference_mode != 'trajectory':
-    st.warning('The selected lookahead target depends on the robot pose. Assigning **vR = nominal speed** and '
-        "**omegaR = vR × estimated curvature** does not make these the carrot's actual velocities. "
-        'The full SMC reaching-law proof does **not** hold directly, and zero carrot-position error is not expected. '
-        'Compare nominal and measured carrot-motion plots below.')
-if reference_mode == 'pp_circle':
-    st.caption('PP method: search forward from closest projection for the first intersection of the robot-centered '
-        'lookahead circle and polyline. If there is no intersection, the fallback is reported. '
-        'Curvature comes from three sampled **positions** around the carrot (not just two).')
+st.warning('The PP-circle target depends on the robot. Nominal vR and omegaR are feedforward, not the carrot\'s actual velocities. At sharp zigzag corners, the three-point window estimates a finite effective curvature even though exact curvature is undefined.')
+
 
 chosen=st.multiselect('Controllers to compare',CONTROLLERS,default=list(CONTROLLERS))
 if not chosen:
@@ -129,51 +117,49 @@ fig.update_layout(height=480,margin=dict(l=10,r=10,b=15,t=15),xaxis_title='X (m)
     legend=dict(orientation='h',y=-0.2),yaxis_scaleanchor='x',hovermode='closest')
 st.plotly_chart(fig,use_container_width=True)
 
-if reference_mode == 'pp_circle':
-    with st.expander('Inspect the PP lookahead circle and sampled curvature', expanded=True):
-        names_available = [r.controller for r in runs if len(r.history['t'])]
-        if names_available:
-            selected = st.selectbox('Controller to inspect', names_available, key='pp_inspect_controller')
-            selected_run = next(r for r in runs if r.controller == selected)
-            h = selected_run.history
-            if len(h['t']) > 1:
-                ti = st.slider('Simulation time to inspect (s)', 0.0, float(h['t'][-1]),
-                               min(5.0, float(h['t'][-1])), step=float(cfg.dt),
-                               key='pp_inspect_time')
-            else:
-                ti = float(h['t'][0])
-                st.caption('Only one timestep was simulated (controller may have stopped early).')
-            i = int(np.argmin(np.abs(h['t'] - ti)))
-            cx, cy = float(h['x'][i]), float(h['y'][i])
-            rx, ry = float(h['rx'][i]), float(h['ry'][i])
-            inspect_path = replanned_path if (replanned_path is not None and h['path_revision'][i]) else path_obj
-            proj_x, proj_y = inspect_path.sample(float(h['path_s'][i]))[:2]
-            a = np.linspace(0., 2 * np.pi, 200)
-            demo = go.Figure()
-            demo.add_trace(go.Scatter(x=inspect_path.x,y=inspect_path.y,mode='lines',
-                line=dict(width=3,color='#87909f'),name='Planner path'))
-            demo.add_trace(go.Scatter(x=cx + lookahead * np.cos(a),
-                y=cy + lookahead * np.sin(a),mode='lines',
-                line=dict(color='#2563eb',width=2,dash='dash'),name='Lookahead circle'))
-            demo.add_trace(go.Scatter(x=[cx,rx],y=[cy,ry],mode='lines',
-                line=dict(color='#d97706',width=2),name='Carrot distance'))
-            demo.add_trace(go.Scatter(x=[cx],y=[cy],mode='markers',
-                marker=dict(symbol='square',size=14,color='#2563eb'),name='Robot'))
-            demo.add_trace(go.Scatter(x=[proj_x],y=[proj_y],mode='markers',
-                marker=dict(symbol='diamond',size=11,color='#10b981'),name='Closest point'))
-            demo.add_trace(go.Scatter(x=[rx],y=[ry],mode='markers',
-                marker=dict(symbol='circle',size=13,color='#d97706'),name='Carrot'))
-            demo.update_layout(height=420,margin=dict(l=10,r=10,b=10,t=15),
-                xaxis_title='X (m)',yaxis_title='Y (m)',yaxis_scaleanchor='x')
-            st.plotly_chart(demo,use_container_width=True)
-            b1,b2,b3,b4 = st.columns(4)
-            b1.metric('Robot–carrot distance',f"{h['carrot_radial_distance'][i]:.3f} m")
-            b2.metric('Circle radius',f'{lookahead:.3f} m')
-            b3.metric('Estimated curvature',f"{h['kappa_ref'][i]:+.3f} 1/m")
-            b4.metric('Nominal omegaR',f"{h['omegaR'][i]:+.3f} rad/s")
-            if bool(h['carrot_fallback'][i]):
-                st.info('No exact forward circle intersection at this timestep: the controller uses a fallback point.')
-
+with st.expander('Inspect the PP lookahead circle and sampled curvature', expanded=True):
+    names_available = [r.controller for r in runs if len(r.history['t'])]
+    if names_available:
+        selected = st.selectbox('Controller to inspect', names_available, key='pp_inspect_controller')
+        selected_run = next(r for r in runs if r.controller == selected)
+        h = selected_run.history
+        if len(h['t']) > 1:
+            ti = st.slider('Simulation time to inspect (s)', 0.0, float(h['t'][-1]),
+                           min(5.0, float(h['t'][-1])), step=float(cfg.dt),
+                           key='pp_inspect_time')
+        else:
+            ti = float(h['t'][0])
+            st.caption('Only one timestep was simulated (controller may have stopped early).')
+        i = int(np.argmin(np.abs(h['t'] - ti)))
+        cx, cy = float(h['x'][i]), float(h['y'][i])
+        rx, ry = float(h['rx'][i]), float(h['ry'][i])
+        inspect_path = replanned_path if (replanned_path is not None and h['path_revision'][i]) else path_obj
+        proj_x, proj_y = inspect_path.sample(float(h['path_s'][i]))[:2]
+        a = np.linspace(0., 2 * np.pi, 200)
+        demo = go.Figure()
+        demo.add_trace(go.Scatter(x=inspect_path.x,y=inspect_path.y,mode='lines',
+            line=dict(width=3,color='#87909f'),name='Planner path'))
+        demo.add_trace(go.Scatter(x=cx + lookahead * np.cos(a),
+            y=cy + lookahead * np.sin(a),mode='lines',
+            line=dict(color='#2563eb',width=2,dash='dash'),name='Lookahead circle'))
+        demo.add_trace(go.Scatter(x=[cx,rx],y=[cy,ry],mode='lines',
+            line=dict(color='#d97706',width=2),name='Carrot distance'))
+        demo.add_trace(go.Scatter(x=[cx],y=[cy],mode='markers',
+            marker=dict(symbol='square',size=14,color='#2563eb'),name='Robot'))
+        demo.add_trace(go.Scatter(x=[proj_x],y=[proj_y],mode='markers',
+            marker=dict(symbol='diamond',size=11,color='#10b981'),name='Closest point'))
+        demo.add_trace(go.Scatter(x=[rx],y=[ry],mode='markers',
+            marker=dict(symbol='circle',size=13,color='#d97706'),name='Carrot'))
+        demo.update_layout(height=420,margin=dict(l=10,r=10,b=10,t=15),
+            xaxis_title='X (m)',yaxis_title='Y (m)',yaxis_scaleanchor='x')
+        st.plotly_chart(demo,use_container_width=True)
+        b1,b2,b3,b4 = st.columns(4)
+        b1.metric('Robot–carrot distance',f"{h['carrot_radial_distance'][i]:.3f} m")
+        b2.metric('Circle radius',f'{lookahead:.3f} m')
+        b3.metric('Estimated curvature',f"{h['kappa_ref'][i]:+.3f} 1/m")
+        b4.metric('Nominal omegaR',f"{h['omegaR'][i]:+.3f} rad/s")
+        if bool(h['carrot_fallback'][i]):
+            st.info('No exact forward circle intersection at this timestep: the controller uses a fallback point.')
 rows=[{'Controller':r.controller,**r.metrics} for r in runs]
 results=pd.DataFrame(rows)
 st.markdown('### Performance comparison')
@@ -246,7 +232,7 @@ with st.expander('Download full data and save/replay comparison'):
 
 st.divider()
 st.markdown('### Batch benchmark (4 paths × 4 starting poses × 4 controllers)')
-st.caption('64 simulations for the current parameters and reference model. See failing / singular runs rather than filtering them out.')
+st.caption('64 simulations using PP-circle references. See failing / singular runs rather than filtering them out.')
 if st.button('Run all 64 cases',type='primary'):
     with st.spinner('Running benchmark...'):
         table=pd.DataFrame(batch(cfg))

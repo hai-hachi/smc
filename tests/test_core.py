@@ -18,10 +18,10 @@ class SMCTests(unittest.TestCase):
         self.assertAlmostEqual(s,3.,places=5)
         self.assertAlmostEqual(y,2.,places=5)
     def test_circle_reference(self):
-        c=Config(path='circle',circle_radius=2.,reference_mode='trajectory')
+        c=Config(path='circle',circle_radius=2.)
         p=make_path(c)
-        r=reference(c,p,1.,0.)
-        self.assertAlmostEqual(r[4],c.v_ref/2,places=5)
+        r=reference(c,p,1.,0.,pose=np.array([0.,0.,0.]))
+        self.assertAlmostEqual(r[4],c.v_ref/2,delta=0.01)
     def test_curvature_varies_on_smooth(self):
         p=make_path(Config(path='smooth'))
         self.assertGreater(np.ptp(p.kappa),0.5)
@@ -29,8 +29,33 @@ class SMCTests(unittest.TestCase):
         c=Config(path='zigzag',zigzag_angle_deg=60.)
         p=make_path(c)
         self.assertAlmostEqual(max(p.theta),math.pi/3,places=4)
+    def test_zigzag_is_sharp_polyline_with_no_rounding(self):
+        angle=math.radians(90.)
+        cfg=Config(path='zigzag',zigzag_angle_deg=90.,zigzag_leg=2.,zigzag_turns=3)
+        p=make_path(cfg,ds=0.1)
+        self.assertTrue(p.sharp_corners)
+        self.assertAlmostEqual(p.length,8.,places=8)
+        self.assertTrue(np.all(p.kappa==0.))  # undefined only at vertices
+        # All consecutive edges must be straight in each leg.
+        directions=np.arctan2(np.diff(p.y),np.diff(p.x))
+        self.assertEqual(len(set(np.round(directions,8))),3)
+        self.assertAlmostEqual(p.sample(1.99)[2],0.,places=8)
+        self.assertAlmostEqual(p.sample(2.)[2],angle,places=8)
+        self.assertAlmostEqual(p.sample(2.01)[2],angle,places=8)
+        # Nonzero *estimated* curvature only when the window spans the corner.
+        self.assertAlmostEqual(sampled_curvature(p,1.,0.1)[1],0.,places=7)
+        self.assertGreater(abs(sampled_curvature(p,2.,0.1)[1]),1.)
+
+    def test_legacy_reference_modes_are_removed(self):
+        self.assertFalse(hasattr(Config(),'reference_mode'))
+        self.assertFalse(hasattr(Config(),'zigzag_radius'))
+        with self.assertRaises(TypeError):
+            Config(reference_mode='trajectory')
+        with self.assertRaises(TypeError):
+            Config(reference_mode='closest_lookahead')
+
     def test_full_laws_reaching_dynamics(self):
-        c=Config(reference_mode='trajectory')
+        c=Config()
         ref=(0.,0.,0.2,0.4,0.1,0.)
         e=(0.3,0.2,0.1,0.5,0.3)
         for method in CONTROLLERS[2:]:
@@ -47,14 +72,14 @@ class SMCTests(unittest.TestCase):
                 sd=ethdot+c.lambda_y*eydot
                 self.assertAlmostEqual(sd,-c.k_s*s2,places=9)
     def test_stationary_aligned_case(self):
-        c=Config(path='straight',reference_mode='trajectory',dx0=0,dy0=0,dtheta_deg=0)
+        c=Config(path='straight',dx0=0,dy0=0,dtheta_deg=0)
         for method in CONTROLLERS:
             r=simulate(c,method)
             self.assertEqual(r.status,'completed')
             self.assertTrue(math.isfinite(r.metrics['path_rmse_m']))
             self.assertLess(r.metrics['path_rmse_m'],0.1)
     def test_singularity_report(self):
-        c=Config(path='straight',reference_mode='trajectory',dx0=0.4,dy0=0,dtheta_deg=0)
+        c=Config(path='straight',lookahead=0.4,dx0=0,dy0=0,dtheta_deg=180.)
         r=simulate(c,CONTROLLERS[3])
         self.assertIn('Singular',r.status)
     def test_pp_circle_intersection_uses_radial_not_arc_distance(self):
@@ -65,14 +90,14 @@ class SMCTests(unittest.TestCase):
         self.assertEqual(reason, 'intersection')
         self.assertAlmostEqual(s, 0.4, places=6)
         self.assertAlmostEqual(math.hypot(p.sample(s)[0],p.sample(s)[1]-0.3),0.5,places=6)
-        cfg = Config(path='straight', reference_mode='pp_circle', lookahead=0.5)
+        cfg = Config(path='straight', lookahead=0.5)
         ref = reference(cfg, p, 1., 0., pose=np.array([0.,0.3,0.]))
         self.assertAlmostEqual(ref[5],0.4,places=6)
         self.assertAlmostEqual(ref[3],0.4,places=6)
         self.assertAlmostEqual(ref[4],0.,places=6)
 
     def test_pp_circle_curvature_on_circle_and_closed_seam(self):
-        cfg = Config(path='circle', circle_radius=2.,reference_mode='pp_circle',lookahead=0.6)
+        cfg = Config(path='circle', circle_radius=2.,lookahead=0.6)
         p = make_path(cfg)
         s,reason = circle_carrot(p,0.,0.,0.6,0.)
         self.assertEqual(reason,'intersection')
@@ -97,7 +122,7 @@ class SMCTests(unittest.TestCase):
         self.assertAlmostEqual(s,4.)
 
     def test_pp_reference_recomputed_when_path_changes(self):
-        cfg=Config(reference_mode='pp_circle',lookahead=1.0)
+        cfg=Config(lookahead=1.0)
         robot=np.array([1.0,0.2,0.])
         pa=make_path(replace(cfg,path='straight'))
         pb=make_path(replace(cfg,path='smooth'))
@@ -109,7 +134,7 @@ class SMCTests(unittest.TestCase):
         self.assertTrue(all(math.isfinite(x) for x in rb))
 
     def test_pp_simulation_diagnostics(self):
-        cfg=Config(path='circle',reference_mode='pp_circle',duration=1.,dt=0.05,
+        cfg=Config(path='circle',duration=1.,dt=0.05,
                    dx0=0.,dy0=0.,dtheta_deg=0.)
         run=simulate(cfg,CONTROLLERS[0])
         self.assertEqual(run.status,'completed')
@@ -121,12 +146,12 @@ class SMCTests(unittest.TestCase):
         self.assertTrue(math.isfinite(run.metrics['carrot_fallback_pct']))
 
     def test_pp_rejects_missing_pose(self):
-        cfg=Config(reference_mode='pp_circle')
+        cfg=Config()
         with self.assertRaises(ValueError):
             reference(cfg,make_path(cfg),0.,0.)
 
     def test_dynamic_replan_changes_reference_and_remains_finite(self):
-        c=Config(path='straight',reference_mode='pp_circle',dx0=0.,dy0=0.,
+        c=Config(path='straight',dx0=0.,dy0=0.,
                  dtheta_deg=0.,duration=4.,dt=0.05,replan_time=2.,replan_offset=1.2)
         original=make_path(c)
         updated=make_replanned_path(original,c.replan_offset)

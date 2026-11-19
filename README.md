@@ -1,6 +1,6 @@
 # SMC Differential Drive Lab (Python)
 
-An interactive kinematic simulation to compare **4 SMC versions × 4 initial cases × 4 paths**, with three reference-selection modes and an optional dynamic path-update experiment.
+An interactive kinematic simulation to compare **4 SMC versions × 4 initial cases × 4 paths**, with a single PP circle-intersection reference and an optional dynamic path-update experiment.
 
 ## Quick start
 
@@ -46,7 +46,7 @@ These are four **research variants**, not four proven globally stabilizing contr
 
 ## PP circle-intersection reference: proposal and implementation
 
-This is the default reference mode in the lab. It is an **experimental, PP-inspired geometry-based feedforward method** for a path that may be updated while the robot drives. It is not an exact time-parameterized reference trajectory.
+This is the only reference mode in the lab. It is an **experimental, PP-inspired geometry-based feedforward method** for a path that may be updated while the robot drives. It is not an exact time-parameterized reference trajectory.
 
 At each control step:
 
@@ -74,14 +74,19 @@ Enable **Replace path during the run** in the UI. At a selected time, the synthe
 
 In an eventual ROS/Nav2 implementation, process the newest `nav_msgs/Path` on each update, keep track of the robot's progress branch to avoid projection jumping between nearby loops, and handle stop/rotate-in-place motion separately. No use of message timestamps as an arrival-time schedule is intended here. Curvature/speed references must also respect wheel-speed, angular-velocity, acceleration, and braking constraints before physical deployment.
 
-## Reference modes: extremely important
+## Reference model: PP circle intersection only
 
-* **Time-based trajectory**: The nominal reference moves along path arc length `sR(t)=vR*t` (clamped at a non-closed endpoint). On differentiable path segments with constant `vR`, `ωR=vR κ` is the true reference angular rate. This is the mathematically appropriate mode to study the SMC error equations. At abrupt curvature jumps (zigzag joins) and final stopping, the reference still has discontinuities / modeling caveats.
-* **Closest point + arc-length lookahead**: At each step project robot onto a path segment and select target `sR = s_closest + L`. The displayed `vR` and `ωR` are only **nominal feedforward**; the actual target motion depends on the robot pose. Consequently the ideal full-SMC proof **does not apply** to this reference without rederivation, and `ex → 0` should not be expected for nonzero lookahead.
+Every SMC variant uses the forward **robot-centered lookahead circle** intersection on
+its current path, with three-point signed curvature near the carrot. The nominal
+feedforward is `vR = v_ref` (default 0.4 m/s, slowed near open endpoints) and
+`omegaR = vR * kappa_est`. All removed reference modes (time-based trajectory
+and closest-point + arc-length lookahead) are no longer selectable or
+supported by `Config`.
 
-* **PP circle intersection**: The carrot is the forward intersection with the robot-centered Euclidean circle. Estimated curvature comes from three points around the carrot; `vR` and `omegaR` are nominal feedforward, **not the actual target derivatives**. No-intersection fallbacks are reported.
-
-The **truncated** laws intentionally set angular feedforward to zero. They can have persistent tracking error on circles and variable-curvature paths. Their default `vR` does not automatically adapt to real reference speed.
+**Model limitation:** the carrot is robot-dependent, so the feedforward is not
+the true carrot velocity and the ideal full-SMC convergence proofs do not
+apply without rederiving the path-relative dynamics. The truncated SMC variants
+still deliberately omit angular feedforward.
 
 ## Initial conditions
 
@@ -96,14 +101,14 @@ Start offsets use the local tangent/normal frame of the first path pose. The UI 
 
 * **Straight:** length-adjustable, zero curvature.
 * **Circle:** radius-adjustable, closed loop, `κ=1/R`.
-* **Zigzag:** user-set heading-change angle, leg length, number of turns and *circular fillet radius*; finite curvature on fillets, but curvature jumps at line/arc junctions. `zigzag_angle_deg` is a change in heading, not an interior polygon angle.
+* **Zigzag (sharp rectilinear-style polyline):** only straight legs with instantaneous corners. Choose leg length, number of turns and heading-change angle (90° by default, with adjustable other angles). **No fillet/corner radius**. `zigzag_angle_deg` is a change in heading, not an interior polygon angle.
 * **Smooth:** numerically integrated arc-length path using a sinusoidal curvature with separately variable minimum and maximum local radii, plus spatial curvature period. Curvature can change sign, so sign-changing bends are possible.
 
-**Zigzag feasibility note:** the path is composed of exact straight and circular segments; at each line-to-arc join curvature jumps. Therefore even though curvature is finite, the requested angular rate may change discontinuously. Finite angular acceleration limits make exact tracking at such joins impossible.
+**Zigzag feasibility note:** geometric curvature is zero on straight legs and **undefined (impulsive) at the sharp corners**. Our PP three-point finite sampling window averages across a corner and yields a finite *effective* curvature and angular feedforward, which depends on the sampling window. This is not a kinematically feasible exact 90°/custom-angle instantaneous turn. For actual robots, smooth the corner or explicitly stop and rotate in place.
 
 ## Metrics and output
 
-The app overlays 2D trajectories, allows PP circle inspection and a mid-run path-update experiment, plots `ex`, `ey`, `eθ`, geometric path error, commands and sliding variables, and displays a comparison table. The settling criterion depends on reference mode: pose error (trajectory mode), versus path-distance plus path-tangent heading error (lookahead mode). Other metrics include RMSE, max error, final error, distance, angular effort, velocity limiting percentage and minimum absolute denominator. Full CSV and configuration JSON exports are available (including sampled curvature, carrot radial distance, fallback flags, reference revision, and measured target rates). Batch mode executes 64 combinations, with failed/singular cases clearly labeled. You can save single comparisons within Streamlit session state and export them to JSON.
+The app overlays 2D trajectories, allows PP circle inspection and a mid-run path-update experiment, plots `ex`, `ey`, `eθ`, geometric path error, commands and sliding variables, and displays a comparison table. The settling criterion always uses geometric path distance and path-tangent heading error. Other metrics include RMSE, max error, final error, distance, angular effort, velocity limiting percentage and minimum absolute denominator. Full CSV and configuration JSON exports are available (including sampled curvature, carrot radial distance, fallback flags, reference revision, and measured target rates). Batch mode executes 64 combinations, with failed/singular cases clearly labeled. You can save single comparisons within Streamlit session state and export them to JSON.
 
 ## Limitations and scope
 
