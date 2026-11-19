@@ -1,6 +1,6 @@
 # SMC Differential Drive Lab (Python)
 
-An interactive kinematic simulation to compare **4 SMC versions × 4 initial cases × 4 fixed paths**.
+An interactive kinematic simulation to compare **4 SMC versions × 4 initial cases × 4 paths**, with three reference-selection modes and an optional dynamic path-update experiment.
 
 ## Quick start
 
@@ -44,10 +44,42 @@ Let `s = eθ + λy ey`, `D = 1 + λy ex`, nominal reference velocity `vR` and fe
 
 These are four **research variants**, not four proven globally stabilizing controllers. In particular, the full controllers have an unavoidable singularity at `D = 0`; the simulator terminates and reports this if `|D|` is below the configured threshold or if the sign of `D` flips between steps. Actuator saturation invalidates ideal reaching-law identities.
 
+## PP circle-intersection reference: proposal and implementation
+
+This is the default reference mode in the lab. It is an **experimental, PP-inspired geometry-based feedforward method** for a path that may be updated while the robot drives. It is not an exact time-parameterized reference trajectory.
+
+At each control step:
+
+1. Find the closest projection `s_near` onto the current path.
+2. Intersect the current forward path polyline with the **Euclidean circle centered at the robot**, radius `lookahead`. Select the first valid intersection after `s_near` (including crossing the closed-loop seam). This matches the defining radial geometry of Pure Pursuit, although the exact pruning/fallback rules are not claimed to reproduce every Nav2 RPP implementation detail.
+3. If there is **no intersection**, record an explicit fallback: path endpoint if the open-path endpoint is inside the circle; closest point otherwise; a forward quarter-loop fallback when a closed loop is entirely inside the circle. Fallback targets are not necessarily a distance `lookahead` from the robot.
+4. Around the carrot at arc length `s_R`, sample the **three positions** `A=P(s_R-h)`, `B=P(s_R)`, `C=P(s_R+h)` (use a forward/backward window near open-path endpoints), where `h = curvature_window`.
+5. Estimate the tangent direction from `C-A` and signed curvature from the three-point circumcircle:
+
+   ```text
+   kappa_R = 2 * cross2d(B-A, C-A) / (|B-A| * |C-B| * |C-A|)
+   ```
+
+   If the three samples are collinear, curvature is zero. A window averages sharp changes and reduces noise but can blur tight turns. **Two positions alone do not determine curvature**; two reliable path tangent headings at separated arc lengths would be an alternative method.
+6. Assign `vR_nom = v_ref` (default **0.40 m/s**, with optional slowdown near the end of open paths). Assign `omegaR_nom = vR_nom * kappa_R`.
+7. Feed `xR, yR, thetaR, vR_nom, omegaR_nom` into all four controllers; truncated controllers deliberately ignore the supplied omega feedforward.
+
+The UI includes a pause-frame inspector that shows the robot-centered circle, current carrot, projection point, and curvature, with explicit fallback status. The Reference / geometry tab plots **nominal vs finite-difference actual carrot rates**, including lateral carrot motion. The metrics include no-intersection fallback percentage.
+
+**Critical mathematical limitation:** a robot-dependent carrot does **not** generally obey `dot xR = vR_nom cos(thetaR)`, `dot yR = vR_nom sin(thetaR)`, `dot thetaR = omegaR_nom`. The true geometric carrot motion can have different longitudinal speed, lateral velocity, or jumps (especially on path replans and projection changes). Thus the full SMC's ideal reaching law and its zero-error conclusions do not directly follow from using this nominal feedforward. Nonzero robot-to-carrot distance is expected with positive lookahead. This mode is intended as a **practical controller experiment**, not a new stability proof.
+
+### Dynamic replanning demonstration
+
+Enable **Replace path during the run** in the UI. At a selected time, the synthetic path changes to a smooth lateral detour that keeps the same start and goal points. Every controller then projects onto the **new** path and recomputes its circle intersection and curvature immediately. The plots show both path versions, along with changes/jumps in carrot position and actual rates. This is a deterministic proxy for dynamic replanning, **not** a real collision-aware Nav2 planner or ROS subscription.
+
+In an eventual ROS/Nav2 implementation, process the newest `nav_msgs/Path` on each update, keep track of the robot's progress branch to avoid projection jumping between nearby loops, and handle stop/rotate-in-place motion separately. No use of message timestamps as an arrival-time schedule is intended here. Curvature/speed references must also respect wheel-speed, angular-velocity, acceleration, and braking constraints before physical deployment.
+
 ## Reference modes: extremely important
 
 * **Time-based trajectory**: The nominal reference moves along path arc length `sR(t)=vR*t` (clamped at a non-closed endpoint). On differentiable path segments with constant `vR`, `ωR=vR κ` is the true reference angular rate. This is the mathematically appropriate mode to study the SMC error equations. At abrupt curvature jumps (zigzag joins) and final stopping, the reference still has discontinuities / modeling caveats.
-* **Closest point + lookahead**: At each step project robot onto a path segment and select target `sR = s_closest + L`. The displayed `vR` and `ωR` are only **nominal feedforward**; the actual target motion depends on the robot pose. Consequently the ideal full-SMC proof **does not apply** to this reference without rederivation, and `ex → 0` should not be expected for nonzero lookahead.
+* **Closest point + arc-length lookahead**: At each step project robot onto a path segment and select target `sR = s_closest + L`. The displayed `vR` and `ωR` are only **nominal feedforward**; the actual target motion depends on the robot pose. Consequently the ideal full-SMC proof **does not apply** to this reference without rederivation, and `ex → 0` should not be expected for nonzero lookahead.
+
+* **PP circle intersection**: The carrot is the forward intersection with the robot-centered Euclidean circle. Estimated curvature comes from three points around the carrot; `vR` and `omegaR` are nominal feedforward, **not the actual target derivatives**. No-intersection fallbacks are reported.
 
 The **truncated** laws intentionally set angular feedforward to zero. They can have persistent tracking error on circles and variable-curvature paths. Their default `vR` does not automatically adapt to real reference speed.
 
@@ -71,7 +103,7 @@ Start offsets use the local tangent/normal frame of the first path pose. The UI 
 
 ## Metrics and output
 
-The app overlays 2D trajectories, plots `ex`, `ey`, `eθ`, geometric path error, commands and sliding variables, and displays a comparison table. The settling criterion depends on reference mode: pose error (trajectory mode), versus path-distance plus path-tangent heading error (lookahead mode). Other metrics include RMSE, max error, final error, distance, angular effort, velocity limiting percentage and minimum absolute denominator. Full CSV and configuration JSON exports are available. Batch mode executes 64 combinations, with failed/singular cases clearly labeled. You can save single comparisons within Streamlit session state and export them to JSON.
+The app overlays 2D trajectories, allows PP circle inspection and a mid-run path-update experiment, plots `ex`, `ey`, `eθ`, geometric path error, commands and sliding variables, and displays a comparison table. The settling criterion depends on reference mode: pose error (trajectory mode), versus path-distance plus path-tangent heading error (lookahead mode). Other metrics include RMSE, max error, final error, distance, angular effort, velocity limiting percentage and minimum absolute denominator. Full CSV and configuration JSON exports are available (including sampled curvature, carrot radial distance, fallback flags, reference revision, and measured target rates). Batch mode executes 64 combinations, with failed/singular cases clearly labeled. You can save single comparisons within Streamlit session state and export them to JSON.
 
 ## Limitations and scope
 

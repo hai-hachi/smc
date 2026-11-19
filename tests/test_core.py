@@ -3,7 +3,7 @@ import unittest
 from dataclasses import replace
 import numpy as np
 from smc_lab.core import (Config, CONTROLLERS, PATHS, CASES, make_path,
-                          simulate, reference, errors, control, batch)
+                          simulate, reference, errors, control, batch, circle_carrot, sampled_curvature, make_replanned_path)
 
 class SMCTests(unittest.TestCase):
     def test_four_paths_are_monotone_and_finite(self):
@@ -57,6 +57,93 @@ class SMCTests(unittest.TestCase):
         c=Config(path='straight',reference_mode='trajectory',dx0=0.4,dy0=0,dtheta_deg=0)
         r=simulate(c,CONTROLLERS[3])
         self.assertIn('Singular',r.status)
+    def test_pp_circle_intersection_uses_radial_not_arc_distance(self):
+        p = make_path(Config(path='straight'))
+        # Robot 0.3 m off a straight path, radial radius 0.5 m.
+        # Forward intersection is 0.4 m ahead, NOT 0.5 m along path.
+        s, reason = circle_carrot(p, 0., 0.3, 0.5, 0.)
+        self.assertEqual(reason, 'intersection')
+        self.assertAlmostEqual(s, 0.4, places=6)
+        self.assertAlmostEqual(math.hypot(p.sample(s)[0],p.sample(s)[1]-0.3),0.5,places=6)
+        cfg = Config(path='straight', reference_mode='pp_circle', lookahead=0.5)
+        ref = reference(cfg, p, 1., 0., pose=np.array([0.,0.3,0.]))
+        self.assertAlmostEqual(ref[5],0.4,places=6)
+        self.assertAlmostEqual(ref[3],0.4,places=6)
+        self.assertAlmostEqual(ref[4],0.,places=6)
+
+    def test_pp_circle_curvature_on_circle_and_closed_seam(self):
+        cfg = Config(path='circle', circle_radius=2.,reference_mode='pp_circle',lookahead=0.6)
+        p = make_path(cfg)
+        s,reason = circle_carrot(p,0.,0.,0.6,0.)
+        self.assertEqual(reason,'intersection')
+        self.assertAlmostEqual(s,4*math.asin(0.6/4),delta=0.02)
+        theta,kappa = sampled_curvature(p,s,cfg.curvature_window)
+        self.assertAlmostEqual(kappa,0.5,delta=0.02)
+        self.assertAlmostEqual(reference(cfg,p,0.,0.,pose=np.array([0.,0.,0.]))[4],0.2,delta=0.01)
+        end = p.sample(p.length-0.05)
+        behind_s,status = circle_carrot(p,end[0],end[1],0.4,p.length-0.05)
+        self.assertEqual(status,'intersection')
+        self.assertGreater(behind_s,p.length)
+        theta2,kappa2 = sampled_curvature(p,behind_s,0.14)
+        self.assertAlmostEqual(kappa2,0.5,delta=0.02)
+
+    def test_pp_no_intersection_reports_fallback(self):
+        p=make_path(Config(path='straight',length=4.))
+        s,status=circle_carrot(p,0.,2.,0.5,0.)
+        self.assertEqual(status,'nearest_fallback')
+        self.assertAlmostEqual(s,0.)
+        s,status=circle_carrot(p,3.8,0.,0.5,3.8)
+        self.assertEqual(status,'end_fallback')
+        self.assertAlmostEqual(s,4.)
+
+    def test_pp_reference_recomputed_when_path_changes(self):
+        cfg=Config(reference_mode='pp_circle',lookahead=1.0)
+        robot=np.array([1.0,0.2,0.])
+        pa=make_path(replace(cfg,path='straight'))
+        pb=make_path(replace(cfg,path='smooth'))
+        sa,_=pa.project(robot[0],robot[1])
+        sb,_=pb.project(robot[0],robot[1])
+        ra=reference(cfg,pa,12.,sa,robot)
+        rb=reference(cfg,pb,12.,sb,robot)
+        self.assertNotAlmostEqual(ra[1],rb[1],delta=0.03)
+        self.assertTrue(all(math.isfinite(x) for x in rb))
+
+    def test_pp_simulation_diagnostics(self):
+        cfg=Config(path='circle',reference_mode='pp_circle',duration=1.,dt=0.05,
+                   dx0=0.,dy0=0.,dtheta_deg=0.)
+        run=simulate(cfg,CONTROLLERS[0])
+        self.assertEqual(run.status,'completed')
+        h=run.history
+        for key in ('kappa_ref','carrot_radial_distance','carrot_fallback',
+                    'actual_ref_longitudinal','actual_ref_lateral','actual_ref_omega'):
+            self.assertEqual(len(h[key]),len(h['t']))
+        self.assertLess(np.max(abs(h['kappa_ref']-0.5)),0.03)
+        self.assertTrue(math.isfinite(run.metrics['carrot_fallback_pct']))
+
+    def test_pp_rejects_missing_pose(self):
+        cfg=Config(reference_mode='pp_circle')
+        with self.assertRaises(ValueError):
+            reference(cfg,make_path(cfg),0.,0.)
+
+    def test_dynamic_replan_changes_reference_and_remains_finite(self):
+        c=Config(path='straight',reference_mode='pp_circle',dx0=0.,dy0=0.,
+                 dtheta_deg=0.,duration=4.,dt=0.05,replan_time=2.,replan_offset=1.2)
+        original=make_path(c)
+        updated=make_replanned_path(original,c.replan_offset)
+        self.assertAlmostEqual(updated.x[0],original.x[0],places=9)
+        self.assertAlmostEqual(updated.y[0],original.y[0],places=9)
+        self.assertAlmostEqual(updated.x[-1],original.x[-1],places=9)
+        self.assertAlmostEqual(updated.y[-1],original.y[-1],places=9)
+        self.assertGreater(np.max(np.abs(updated.y-original.y)),1.0)
+        self.assertTrue(np.all(np.diff(updated.s)>0))
+        run=simulate(c,CONTROLLERS[0],original)
+        self.assertEqual(run.status,'completed')
+        h=run.history
+        self.assertTrue(np.all(h['path_revision'][h['t']<2]==0))
+        self.assertTrue(np.all(h['path_revision'][h['t']>=2]==1))
+        self.assertTrue(np.all(np.isfinite(h['actual_ref_omega'])))
+        self.assertGreater(np.max(abs(h['actual_ref_lateral'])),0.0)
+
     def test_batch_count(self):
         c=Config(duration=1.,dt=0.1)
         rows=batch(c)

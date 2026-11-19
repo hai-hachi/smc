@@ -35,7 +35,7 @@ def clip(x, a, b):
 @dataclass
 class Config:
     path: str = 'smooth'
-    reference_mode: str = 'closest_lookahead'
+    reference_mode: str = 'pp_circle'
     dx0: float = 0.0
     dy0: float = 2.0
     dtheta_deg: float = 0.0
@@ -43,6 +43,9 @@ class Config:
     dt: float = 0.05
     v_ref: float = 0.40
     lookahead: float = 0.60
+    curvature_window: float = 0.14
+    replan_time: float = 0.0  # 0 disables replanning demo
+    replan_offset: float = 0.75  # metres, peak lateral path deformation
     length: float = 14.0
     circle_radius: float = 2.0
     zigzag_angle_deg: float = 75.0
@@ -71,17 +74,19 @@ class Config:
     singular_guard: float = 0.06
 
     def validate(self):
-        if self.path not in PATHS or self.reference_mode not in ('trajectory','closest_lookahead'):
+        if self.path not in PATHS or self.reference_mode not in ('trajectory','closest_lookahead','pp_circle'):
             raise ValueError('Invalid path or reference mode')
         for name in ('duration','dt','length','circle_radius','zigzag_leg','zigzag_radius',
                      'smooth_radius_min','smooth_radius_max','smooth_period','lambda_y',
-                     'k_s','k_x','k_rho','v_max','w_max','a_max','alpha_max','singular_guard'):
+                     'k_s','k_x','k_rho','curvature_window','v_max','w_max','a_max','alpha_max','singular_guard'):
             if getattr(self, name) <= 0:
                 raise ValueError(f'{name} must be positive')
         if self.smooth_radius_min > self.smooth_radius_max:
             raise ValueError('smooth_radius_min must not exceed smooth_radius_max')
         if not 5 <= self.zigzag_angle_deg <= 165 or self.zigzag_turns < 1:
             raise ValueError('Invalid zigzag geometry')
+        if self.replan_time < 0 or self.replan_offset < -3 or self.replan_offset > 3:
+            raise ValueError('Invalid replan configuration')
         if self.v_ref < 0 or self.lookahead < 0 or self.slowdown_dist < 0:
             raise ValueError('Negative reference or slowdown parameter')
         return self
@@ -176,6 +181,123 @@ def make_path(c: Config, ds=0.04):
     return Path(arr[:,0],arr[:,1],arr[:,2],arr[:,3],arr[:,4])
 
 
+
+
+def make_replanned_path(original: Path, lateral_offset: float) -> Path:
+    """Illustrative path update: a lateral detour that preserves start/end.
+
+    The offset is sin^2(pi*s/total) along the normal and goes to zero at
+    both endpoints. Recompute arc length, tangent and curvature after update.
+    This is not a collision-aware planner; it is a repeatable replan stress test.
+    """
+    fraction = original.s / original.length
+    lateral = lateral_offset * np.sin(math.pi * fraction) ** 2
+    xx = original.x - np.sin(original.theta) * lateral
+    yy = original.y + np.cos(original.theta) * lateral
+    ds = np.hypot(np.diff(xx), np.diff(yy))
+    if np.any(ds < 1e-9):
+        raise ValueError('Replan produced coincident samples')
+    ss = np.r_[0., np.cumsum(ds)]
+    tangent = np.unwrap(np.arctan2(np.gradient(yy), np.gradient(xx)))
+    # np.gradient above uses unit-index spacing; the ratio is valid for heading.
+    curvature = np.gradient(tangent, ss)
+    return Path(ss, xx, yy, tangent, curvature, original.closed)
+
+
+def circle_carrot(path: Path, robot_x: float, robot_y: float, radius: float,
+                  closest_s: float | None = None):
+    """Find the first forward path/circle intersection, using exact segment roots.
+
+    Returns (arc_length, reason). ``closest_s`` is the projection onto the
+    path. Search starts there so earlier path intersections are not selected.
+    A closed path is searched for up to one full circuit, including across
+    its stored seam. This is *radial*, not a fixed distance along the path.
+
+    No-intersection fallback is explicit: choose the endpoint for an open path
+    whose endpoint is within the circle, otherwise choose closest projection.
+    For a closed path entirely inside the circle, choose a point about one
+    quarter lap ahead (labelled as a fallback, not an exact intersection).
+    """
+    if closest_s is None:
+        closest_s, _ = path.project(robot_x, robot_y)
+    if radius <= 0.0:
+        return float(closest_s), 'nearest_fallback'
+    end_s = closest_s + path.length if path.closed else path.length
+    if end_s <= closest_s + 1e-12:
+        return float(closest_s), 'end_fallback'
+
+    grid = (np.r_[path.s, path.s[1:] + path.length]
+            if path.closed else path.s)
+    interior = grid[(grid > closest_s + 1e-10) & (grid < end_s - 1e-10)]
+    distances = np.r_[closest_s, interior, end_s]
+    if path.closed:
+        d = np.mod(distances, path.length)
+    else:
+        d = distances
+    px = np.interp(d, path.s, path.x)
+    py = np.interp(d, path.s, path.y)
+    vx, vy = np.diff(px), np.diff(py)
+    ox, oy = px[:-1] - robot_x, py[:-1] - robot_y
+    aa = vx * vx + vy * vy
+    bb = ox * vx + oy * vy
+    cc = ox * ox + oy * oy - radius * radius
+    disc = bb * bb - aa * cc
+    valid = (aa > 1e-14) & (disc >= -1e-12)
+    if np.any(valid):
+        indices = np.flatnonzero(valid)
+        root = np.sqrt(np.maximum(disc[indices], 0.0))
+        aa_i, bb_i = aa[indices], bb[indices]
+        candidates = []
+        for fraction in ((-bb_i - root) / aa_i, (-bb_i + root) / aa_i):
+            possible = (fraction >= -1e-8) & (fraction <= 1.0 + 1e-8)
+            if np.any(possible):
+                ii = indices[possible]
+                uu = np.clip(fraction[possible], 0., 1.)
+                sc = distances[ii] + uu * (distances[ii+1] - distances[ii])
+                candidates.extend(sc[sc > closest_s + 1e-7])
+        if candidates:
+            return float(min(candidates)), 'intersection'
+
+    if not path.closed:
+        distance_to_end = math.hypot(path.x[-1] - robot_x,
+                                     path.y[-1] - robot_y)
+        if distance_to_end < radius + 1e-7:
+            return float(path.length), 'end_fallback'
+        return float(closest_s), 'nearest_fallback'
+    # A large circle may contain the entire closed path: no exact carrot.
+    start_dist = math.hypot(path.sample(closest_s)[0] - robot_x,
+                            path.sample(closest_s)[1] - robot_y)
+    if start_dist < radius:
+        return float(closest_s + path.length * 0.25), 'loop_fallback'
+    return float(closest_s), 'nearest_fallback'
+
+
+def sampled_curvature(path: Path, s: float, window: float):
+    """Estimate signed kappa at s from three neighboring *positions*.
+
+    Two positions only determine a chord/tangent, not curvature. We use
+    points a,b,c along arc length and the signed circumcircle curvature
+    2*cross(b-a,c-a)/(|b-a|*|c-b|*|c-a|).
+    Also returns local tangent angle from a -> c, for e_theta.
+    A window naturally smooths abrupt corner curvature at its scale.
+    """
+    half = min(window, path.length / 2.0)
+    if path.closed:
+        ds = (s - half, s, s + half)
+    else:
+        begin = clip(s - half, 0., max(0., path.length - 2 * half))
+        ds = (begin, begin + half, begin + 2 * half)
+    a, b, c = (path.sample(v)[:2] for v in ds)
+    abx, aby = b[0] - a[0], b[1] - a[1]
+    bcx, bcy = c[0] - b[0], c[1] - b[1]
+    acx, acy = c[0] - a[0], c[1] - a[1]
+    cross = abx * acy - aby * acx
+    divisor = math.hypot(abx, aby) * math.hypot(bcx, bcy) * math.hypot(acx, acy)
+    kappa = (2 * cross / divisor) if divisor > 1e-12 else 0.
+    heading = math.atan2(acy, acx) if math.hypot(acx, acy) > 1e-12 else path.sample(s)[2]
+    return heading, kappa
+
+
 def initial_pose(c,p):
     x,y,th,_=p.sample(0.)
     return np.array([x+c.dx0*math.cos(th)-c.dy0*math.sin(th),
@@ -183,17 +305,37 @@ def initial_pose(c,p):
                      wrap(th+math.radians(c.dtheta_deg))],dtype=float)
 
 
-def reference(c,p,t,s_near):
-    s=c.v_ref*t if c.reference_mode=='trajectory' else s_near+c.lookahead
-    if not p.closed: s=min(p.length,s)
-    x,y,th,k=p.sample(s)
-    if p.closed: v=c.v_ref
-    elif c.reference_mode=='trajectory': v=c.v_ref if s<p.length-1e-8 else 0.0
+def reference(c, p, t, s_near, pose=None, carrot=None):
+    """Build nominal reference state; circle/arc lookahead is robot-dependent.
+
+    p can be replaced on every cycle when a Nav2 path is replanned. For
+    pp_circle, carrot is an optional precomputed (s, status) tuple.
+    """
+    if c.reference_mode == 'trajectory':
+        s = c.v_ref * t
+    elif c.reference_mode == 'closest_lookahead':
+        s = s_near + c.lookahead
     else:
-        remaining=max(0.,p.length-s_near)
-        v=c.v_ref * (min(1.,remaining/c.slowdown_dist) if c.slowdown_dist else 1.)
-        if remaining<=0.025: v=0.
-    return (x,y,th,v,v*k,s)
+        if carrot is None:
+            if pose is None:
+                raise ValueError('pp_circle requires robot pose or precomputed carrot')
+            carrot = circle_carrot(p, float(pose[0]), float(pose[1]), c.lookahead, s_near)
+        s = carrot[0]
+    if not p.closed:
+        s = min(p.length, s)
+    x, y, th, k = p.sample(s)
+    if c.reference_mode == 'pp_circle':
+        th, k = sampled_curvature(p, s, c.curvature_window)
+    if p.closed:
+        v = c.v_ref
+    elif c.reference_mode == 'trajectory':
+        v = c.v_ref if s < p.length-1e-8 else 0.0
+    else:
+        remaining = max(0., p.length - s_near)
+        v = c.v_ref * (min(1., remaining / c.slowdown_dist) if c.slowdown_dist else 1.)
+        if remaining <= 0.025:
+            v = 0.
+    return (x, y, th, v, v * k, s)
 
 
 def errors(pose,ref):
@@ -259,17 +401,29 @@ def simulate(c,method,p=None):
     c=replace(c).validate()
     p=make_path(c) if p is None else p
     pose=initial_pose(c,p)
+    alternate=make_replanned_path(p,c.replan_offset) if c.replan_time>0 else None
+    active_path=p
     v_old=w_old=0.
     names=('t','x','y','theta','rx','ry','rtheta','vR','omegaR','ex','ey',
            'etheta','rho','s1','s2','denom','v','omega','desired_v','desired_omega',
-           'path_s','path_error','path_heading_error','reference_s','limited')
+           'path_s','path_error','path_heading_error','reference_s','limited',
+           'kappa_ref','carrot_radial_distance','carrot_fallback','path_revision')
     hist={name:[] for name in names}
     status='completed'
     previous_den=None
     for i in range(round(c.duration/c.dt)+1):
         t=i*c.dt
-        nearest,signed=p.project(float(pose[0]),float(pose[1]))
-        ref=reference(c,p,t,nearest)
+        if alternate is not None and t >= c.replan_time:
+            active_path=alternate
+        nearest,signed=active_path.project(float(pose[0]),float(pose[1]))
+        carrot = (circle_carrot(active_path, float(pose[0]), float(pose[1]),
+                                c.lookahead, nearest)
+                  if c.reference_mode == 'pp_circle' else None)
+        ref = reference(c, active_path, t, nearest, pose=pose, carrot=carrot)
+        k_ref = (sampled_curvature(active_path, ref[5], c.curvature_window)[1]
+                 if c.reference_mode == 'pp_circle' else active_path.sample(ref[5])[3])
+        carrot_radial = math.hypot(ref[0] - pose[0], ref[1] - pose[1])
+        carrot_fallback = float(carrot is not None and carrot[1] != 'intersection')
         e=errors(pose,ref)
         try:
             v_des,w_des,s1,s2,den=control(c,method,ref,e)
@@ -284,9 +438,10 @@ def simulate(c,method,p=None):
         limited=abs(v_limit-v_des)>1e-8 or abs(w_limit-w_des)>1e-8
         v=v_old+clip(v_limit-v_old,-c.a_max*c.dt,c.a_max*c.dt)
         w=w_old+clip(w_limit-w_old,-c.alpha_max*c.dt,c.alpha_max*c.dt)
-        path_th=p.sample(nearest)[2]
+        path_th=active_path.sample(nearest)[2]
         values=(t,*pose,*ref[:3],ref[3],ref[4],e[0],e[1],e[2],e[3],s1,s2,den,
-                v,w,v_des,w_des,nearest,abs(signed),wrap(path_th-pose[2]),ref[5],float(limited))
+                v,w,v_des,w_des,nearest,abs(signed),wrap(path_th-pose[2]),ref[5],float(limited),
+                k_ref,carrot_radial,carrot_fallback,float(alternate is not None and t>=c.replan_time))
         if not all(math.isfinite(z) for z in values):
             status='Non-finite state or command';break
         for name,val in zip(names,values): hist[name].append(float(val))
@@ -296,6 +451,26 @@ def simulate(c,method,p=None):
         pose[2]=wrap(pose[2]+w*c.dt)
         v_old,w_old=v,w
     h={name:np.asarray(vals) for name,vals in hist.items()}
+    # Finite-difference geometric target motion for diagnostics only.
+    # This is not fed into the four existing SMC control laws, which use
+    # nominal feedforward. A carrot tied to robot projection can jump or
+    # move laterally, violating the reference unicycle model.
+    n_ref = len(h['t'])
+    if n_ref > 1:
+        interval = np.diff(h['t'])
+        vx = np.diff(h['rx']) / interval
+        vy = np.diff(h['ry']) / interval
+        angle = h['rtheta'][:-1]
+        vlong = vx*np.cos(angle) + vy*np.sin(angle)
+        vlat = -vx*np.sin(angle) + vy*np.cos(angle)
+        wactual = np.arctan2(np.sin(np.diff(h['rtheta'])),
+                             np.cos(np.diff(h['rtheta']))) / interval
+        h['actual_ref_longitudinal'] = np.r_[vlong, vlong[-1]]
+        h['actual_ref_lateral'] = np.r_[vlat, vlat[-1]]
+        h['actual_ref_omega'] = np.r_[wactual, wactual[-1]]
+    else:
+        for key in ('actual_ref_longitudinal','actual_ref_lateral','actual_ref_omega'):
+            h[key] = np.zeros(n_ref)
     if not len(h['t']):
         return Run(c,method,p,h,{'status':status,'path_rmse_m':math.nan},status)
     mask=h['t']>=c.warmup
@@ -318,7 +493,11 @@ def simulate(c,method,p=None):
         angular_effort_rad=float(np.sum(np.abs(h['omega']))*c.dt),
         limited_pct=float(np.mean(h['limited'])*100),
         min_abs_den=float(np.min(np.abs(h['denom']))),
-        elapsed_s=float(h['t'][-1]))
+        elapsed_s=float(h['t'][-1]),
+        replanned=bool(np.any(h['path_revision']>0)),
+        carrot_fallback_pct=float(np.mean(h['carrot_fallback'])*100),
+        carrot_radius_rmse_m=float(np.sqrt(np.mean((h['carrot_radial_distance']-c.lookahead)**2)))
+          if c.reference_mode == 'pp_circle' else math.nan)
     return Run(c,method,p,h,metrics,status)
 
 
