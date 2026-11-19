@@ -1,7 +1,7 @@
 """SMC differential-drive kinematic comparison laboratory.
 
-Physical actuator clamps are used; no sign() or sat() switching term appears
-in any SMC control law. The PP-circle carrot is robot-dependent, so
+Boundary-layer saturation switching is available in every SMC law.
+Physical actuator clamps are separate. The PP-circle carrot is robot-dependent, so
 nominal feedforward does not represent its actual derivatives; see README.
 """
 from __future__ import annotations
@@ -32,6 +32,11 @@ def clip(x, a, b):
     return max(a, min(b, x))
 
 
+def sat(x):
+    """Continuous SMC boundary-layer saturation, independent of actuator limits."""
+    return clip(x, -1.0, 1.0)
+
+
 @dataclass
 class Config:
     path: str = 'smooth'
@@ -57,6 +62,11 @@ class Config:
     lambda_x: float = 0.6
     k_s: float = 1.2
     k_x: float = 0.8
+    use_saturation: bool = True
+    eta: float = 0.40   # angular sliding-surface switching strength [rad/s]
+    phi: float = 0.30   # angular sliding-surface boundary layer
+    eta_x: float = 0.25 # full-law ex reaching strength [m/s]
+    phi_x: float = 0.30 # full-law ex boundary layer [m]
     k_rho: float = 0.8
     heading_stop_deg: float = 70.0
     v_max: float = 0.60
@@ -76,9 +86,13 @@ class Config:
             raise ValueError('Invalid path or reference mode')
         for name in ('duration','dt','length','circle_radius','zigzag_leg',
                      'smooth_radius_min','smooth_radius_max','smooth_period','lambda_y',
-                     'k_s','k_x','k_rho','curvature_window','v_max','w_max','a_max','alpha_max','singular_guard'):
+                     'k_s','k_x','k_rho','phi','phi_x','curvature_window','v_max','w_max','a_max','alpha_max','singular_guard'):
             if getattr(self, name) <= 0:
                 raise ValueError(f'{name} must be positive')
+        if self.eta < 0 or self.eta_x < 0:
+            raise ValueError('Switching gains eta and eta_x must be nonnegative')
+        if not isinstance(self.use_saturation, bool):
+            raise ValueError('use_saturation must be a boolean')
         if self.smooth_radius_min > self.smooth_radius_max:
             raise ValueError('smooth_radius_min must not exceed smooth_radius_max')
         if not 5 <= self.zigzag_angle_deg <= 165 or self.zigzag_turns < 1:
@@ -344,32 +358,54 @@ def errors(pose,ref):
     return ex,ey,eth,rho,alpha
 
 
-def control(c,method,ref,e):
-    """Returns (desired_v, desired_w, first_surface, second_surface, denominator).
+def switching_terms(c, method, ex, s1, s2):
+    """Return (longitudinal switch [m/s], angular numerator switch [rad/s]).
 
-    Truncated versions intentionally omit angular feedforward wR and the
-    nonlinear denominator, matching the user's approximate baseline.
+    Full controllers use a separate boundary layer for e_x. The angular
+    switch acts on the active sliding surface: s1 for full-one-surface,
+    s2 for all other variants. For full controllers it is divided by D
+    inside the computed angular velocity, like the other numerator terms.
+    """
+    if not c.use_saturation:
+        return 0.0, 0.0
+    linear = c.eta_x * sat(ex / c.phi_x) if method in CONTROLLERS[2:] else 0.0
+    angular_surface = s1 if method == CONTROLLERS[2] else s2
+    return linear, c.eta * sat(angular_surface / c.phi)
+
+
+def control(c,method,ref,e):
+    """Return desired v, omega, s1, s2, D.
+
+    Saturation means continuous boundary-layer switching feedback,
+    *not* the physical velocity clamp. Truncated variants deliberately
+    omit omegaR feedforward and denominator D.
     """
     if method not in CONTROLLERS: raise ValueError('Unknown SMC version')
     ex,ey,eth,rho,alpha=e
     vr,wr=ref[3:5]
     s2=eth+c.lambda_y*ey
     if method==CONTROLLERS[0]:
-        return vr,c.lambda_y*vr*math.sin(eth)+c.k_s*s2,0.,s2,1.
+        _, angular_switch = switching_terms(c,method,ex,0.,s2)
+        return vr,c.lambda_y*vr*math.sin(eth)+c.k_s*s2+angular_switch,0.,s2,1.
     if method==CONTROLLERS[1]:
         v=c.k_rho*rho*math.cos(alpha)
         if abs(alpha)>=math.radians(c.heading_stop_deg): v=0.
-        return max(0.,v),c.lambda_y*vr*math.sin(eth)+c.k_s*s2,0.,s2,1.
+        _, angular_switch = switching_terms(c,method,ex,0.,s2)
+        return max(0.,v),c.lambda_y*vr*math.sin(eth)+c.k_s*s2+angular_switch,0.,s2,1.
     denom=1+c.lambda_y*ex
     if abs(denom)<=c.singular_guard:
         raise ArithmeticError(f'Singular full SMC: 1+lambda*ex={denom:.4f}')
     if method==CONTROLLERS[2]:
         s=s2+c.lambda_x*ex
-        w=(wr+c.lambda_y*vr*math.sin(eth)-c.lambda_x*c.k_x*ex+c.k_s*s)/denom
-        v=vr*math.cos(eth)+ey*w+c.k_x*ex
+        linear_switch, angular_switch = switching_terms(c,method,ex,s,0.)
+        longitudinal_correction = c.k_x*ex + linear_switch
+        w=(wr+c.lambda_y*vr*math.sin(eth)
+           -c.lambda_x*longitudinal_correction+c.k_s*s+angular_switch)/denom
+        v=vr*math.cos(eth)+ey*w+longitudinal_correction
         return v,w,s,0.,denom
-    w=(wr+c.lambda_y*vr*math.sin(eth)+c.k_s*s2)/denom
-    v=vr*math.cos(eth)+ey*w+c.k_x*ex
+    linear_switch, angular_switch = switching_terms(c,method,ex,ex,s2)
+    w=(wr+c.lambda_y*vr*math.sin(eth)+c.k_s*s2+angular_switch)/denom
+    v=vr*math.cos(eth)+ey*w+c.k_x*ex+linear_switch
     return v,w,ex,s2,denom
 
 
@@ -402,7 +438,8 @@ def simulate(c,method,p=None):
     names=('t','x','y','theta','rx','ry','rtheta','vR','omegaR','ex','ey',
            'etheta','rho','s1','s2','denom','v','omega','desired_v','desired_omega',
            'path_s','path_error','path_heading_error','reference_s','limited',
-           'kappa_ref','carrot_radial_distance','carrot_fallback','path_revision')
+           'kappa_ref','carrot_radial_distance','carrot_fallback','path_revision',
+           'switch_v_term','switch_omega_term')
     hist={name:[] for name in names}
     status='completed'
     previous_den=None
@@ -423,6 +460,7 @@ def simulate(c,method,p=None):
             if method in CONTROLLERS[2:] and previous_den is not None and den*previous_den<0:
                 raise ArithmeticError('Full SMC denominator crossed zero')
             previous_den=den
+            switch_v_term,switch_omega_term=switching_terms(c,method,e[0],s1,s2)
         except ArithmeticError as exc:
             status=str(exc);break
         v_min=-c.v_max if c.allow_reverse and method in CONTROLLERS[2:] else 0.
@@ -434,7 +472,8 @@ def simulate(c,method,p=None):
         path_th=active_path.sample(nearest)[2]
         values=(t,*pose,*ref[:3],ref[3],ref[4],e[0],e[1],e[2],e[3],s1,s2,den,
                 v,w,v_des,w_des,nearest,abs(signed),wrap(path_th-pose[2]),ref[5],float(limited),
-                k_ref,carrot_radial,carrot_fallback,float(alternate is not None and t>=c.replan_time))
+                k_ref,carrot_radial,carrot_fallback,float(alternate is not None and t>=c.replan_time),
+                switch_v_term,switch_omega_term)
         if not all(math.isfinite(z) for z in values):
             status='Non-finite state or command';break
         for name,val in zip(names,values): hist[name].append(float(val))

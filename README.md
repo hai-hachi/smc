@@ -29,20 +29,40 @@ The robot's kinematic center is the controlled point (`c = 0`). The body-frame e
 \dot e_\theta=\omega_R-\omega.
 \]
 
-All four SMC laws **omit both `sign(s)` and `sat(s/phi)`**. We use only continuous proportional sliding-surface feedback `k_s s`. The separate physical velocity and acceleration limits are retained in simulation.
+The four controllers now restore **continuous boundary-layer SMC switching**:
 
-Let `s = eθ + λy ey`, `D = 1 + λy ex`, nominal reference velocity `vR` and feedforward `ωR = vR κ`.
+```text
+sat(z) = clamp(z, -1, 1)
+angular switching = eta * sat(surface / phi)
+longitudinal switching = eta_x * sat(ex / phi_x)  (full versions only)
+```
+
+Both switching terms can be disabled with `use_saturation = False`, reproducing the
+previous proportional-only controllers exactly. The default parameters are
+`eta=0.40 rad/s`, `phi=0.30`, `eta_x=0.25 m/s`, and `phi_x=0.30 m`.
+The `phi` boundary-layer is measured in the units of the composite angular sliding variable;
+`phi_x` is measured in metres. The saturation function is continuous (not sign switching).
+**Actuator velocity and acceleration clipping remain independent** of the SMC saturation.
+
+Define `s = etheta + lambda_y * ey`, `D = 1 + lambda_y * ex`,
+`g_x = k_x * ex + eta_x * sat(ex / phi_x)` for the full laws,
+`q(s) = k_s * s + eta * sat(s / phi)`.
+When switching is disabled, both eta terms are treated as zero.
 
 | Version | Desired linear velocity | Desired angular velocity |
 |---|---|---|
-| **Truncated: fixed speed** | `v = vR` | `ω = λy vR sin(eθ) + ks s` |
-| **Truncated: scaled speed** | `v = max(0, kρ ρ cos(α))`, zero when `abs(α) >= heading_stop` | same truncated ω |
-| **Full: one surface (all three)** | `v = vR cos(eθ) + ey ω + kx ex` | `ω = [ωR + λy vR sin(eθ) − λx kx ex + ks s_all] / D`, `s_all = eθ + λy ey + λx ex` |
-| **Full: two surfaces** | `v = vR cos(eθ) + ey ω + kx ex` | `ω = [ωR + λy vR sin(eθ) + ks s] / D`, `s1 = ex`, `s2 = s` |
+| **Truncated: fixed speed** | `v = vR` | `omega = lambda_y*vR*sin(etheta) + q(s)` |
+| **Truncated: scaled speed** | `v = max(0, k_rho*rho*cos(alpha))`, zero when `abs(alpha) >= heading_stop` | same truncated omega |
+| **Full: one surface (all three)** | `v = vR*cos(etheta) + ey*omega + g_x` | `omega = [omegaR + lambda_y*vR*sin(etheta) - lambda_x*g_x + q(s_all)] / D`; `s_all = s + lambda_x*ex` |
+| **Full: two surfaces** | `v = vR*cos(etheta) + ey*omega + g_x` | `omega = [omegaR + lambda_y*vR*sin(etheta) + q(s)] / D`; `s1=ex`, `s2=s` |
 
-**Why the full single-surface controller includes `−λx kx ex`:** With the chosen longitudinal law, `ex_dot = −kx ex`. Differentiating `s_all = s + λx ex` then gives `s_all_dot = ωR + λy vR sin(eθ) − D ω − λx kx ex`. The extra term is needed to impose `s_all_dot = −ks s_all`.
-
-These are four **research variants**, not four proven globally stabilizing controllers. In particular, the full controllers have an unavoidable singularity at `D = 0`; the simulator terminates and reports this if `|D|` is below the configured threshold or if the sign of `D` flips between steps. Actuator saturation invalidates ideal reaching-law identities.
+For an ideal, feasible, nonsingular reference, the full laws impose
+`ex_dot = -k_x*ex - eta_x*sat(ex/phi_x)`. The one-surface full law imposes
+`(s_all)_dot = -k_s*s_all - eta*sat(s_all/phi)`; the two-surface full law imposes
+`(s2)_dot = -k_s*s2 - eta*sat(s2/phi)`.
+These relationships do **not** guarantee global stability or exact tracking of a
+robot-dependent PP carrot. The denominator singularity `D=0` and actuator saturation
+remain possible. The single-surface law's zero dynamics must still be checked.
 
 ## PP circle-intersection reference: proposal and implementation
 
@@ -108,7 +128,7 @@ Start offsets use the local tangent/normal frame of the first path pose. The UI 
 
 ## Metrics and output
 
-The app overlays 2D trajectories, allows PP circle inspection and a mid-run path-update experiment, plots `ex`, `ey`, `eθ`, geometric path error, commands and sliding variables, and displays a comparison table. The settling criterion always uses geometric path distance and path-tangent heading error. Other metrics include RMSE, max error, final error, distance, angular effort, velocity limiting percentage and minimum absolute denominator. Full CSV and configuration JSON exports are available (including sampled curvature, carrot radial distance, fallback flags, reference revision, and measured target rates). Batch mode executes 64 combinations, with failed/singular cases clearly labeled. You can save single comparisons within Streamlit session state and export them to JSON.
+The app overlays 2D trajectories, allows PP circle inspection and a mid-run path-update experiment, plots `ex`, `ey`, `eθ`, geometric path error, commands, sliding variables and switching components, and displays a comparison table. The settling criterion always uses geometric path distance and path-tangent heading error. Other metrics include RMSE, max error, final error, distance, angular effort, velocity limiting percentage and minimum absolute denominator. Full CSV and configuration JSON exports are available (including sampled curvature, carrot radial distance, fallback flags, reference revision, and measured target rates). Batch mode executes 64 combinations, with failed/singular cases clearly labeled. You can save single comparisons within Streamlit session state and export them to JSON.
 
 ## Limitations and scope
 

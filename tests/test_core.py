@@ -3,7 +3,7 @@ import unittest
 from dataclasses import replace
 import numpy as np
 from smc_lab.core import (Config, CONTROLLERS, PATHS, CASES, make_path,
-                          simulate, reference, errors, control, batch, circle_carrot, sampled_curvature, make_replanned_path)
+                          simulate, reference, errors, control, batch, circle_carrot, sampled_curvature, make_replanned_path, sat, switching_terms)
 
 class SMCTests(unittest.TestCase):
     def test_four_paths_are_monotone_and_finite(self):
@@ -64,13 +64,64 @@ class SMCTests(unittest.TestCase):
             exdot=ref[3]*math.cos(eth)-v+ey*w
             eydot=ref[3]*math.sin(eth)-ex*w
             ethdot=ref[4]-w
-            self.assertAlmostEqual(exdot,-c.k_x*ex,places=9)
+            self.assertAlmostEqual(exdot,-c.k_x*ex-c.eta_x*sat(ex/c.phi_x),places=9)
             if method==CONTROLLERS[2]:
                 sd=ethdot+c.lambda_y*eydot+c.lambda_x*exdot
-                self.assertAlmostEqual(sd,-c.k_s*s1,places=9)
+                self.assertAlmostEqual(sd,-c.k_s*s1-c.eta*sat(s1/c.phi),places=9)
             else:
                 sd=ethdot+c.lambda_y*eydot
-                self.assertAlmostEqual(sd,-c.k_s*s2,places=9)
+                self.assertAlmostEqual(sd,-c.k_s*s2-c.eta*sat(s2/c.phi),places=9)
+    def test_saturation_function_and_parameter_validation(self):
+        self.assertEqual(sat(3.0), 1.0)
+        self.assertEqual(sat(-3.0), -1.0)
+        self.assertAlmostEqual(sat(0.25), 0.25)
+        self.assertEqual(sat(0.), 0.)
+        for kw in ({'phi':0.}, {'phi_x':0.}, {'eta':-0.1}, {'eta_x':-0.1}):
+            with self.assertRaises(ValueError):
+                Config(**kw).validate()
+
+    def test_truncated_laws_switch_with_saturation(self):
+        cfg = Config()
+        ref = (0.,0.,0.,0.4,0.2,0.)
+        e = (0.2,0.8,0.1,1.0,0.0)
+        surface = e[2] + cfg.lambda_y*e[1]
+        base = cfg.lambda_y*ref[3]*math.sin(e[2])+cfg.k_s*surface
+        for method in CONTROLLERS[:2]:
+            _,w,*_ = control(cfg,method,ref,e)
+            self.assertAlmostEqual(w,base+cfg.eta,places=9)
+        # When switched off, the previous law is reproduced exactly.
+        cfg.use_saturation = False
+        for method in CONTROLLERS[:2]:
+            _,w,*_ = control(cfg,method,ref,e)
+            self.assertAlmostEqual(w,base,places=9)
+
+    def test_switching_disabled_matches_previous_full_laws(self):
+        cfg=Config(use_saturation=False)
+        ref=(0.,0.,0.2,0.4,0.1,0.)
+        e=(0.3,0.2,0.1,0.5,0.3)
+        ex,ey,eth=e[:3]
+        s2=eth+cfg.lambda_y*ey
+        den=1+cfg.lambda_y*ex
+        for method in CONTROLLERS[2:]:
+            v,w,s1,s2_out,_=control(cfg,method,ref,e)
+            surface=s2+cfg.lambda_x*ex if method==CONTROLLERS[2] else s2
+            subtract=cfg.lambda_x*cfg.k_x*ex if method==CONTROLLERS[2] else 0.
+            expected_w=(ref[4]+cfg.lambda_y*ref[3]*math.sin(eth)-subtract+cfg.k_s*surface)/den
+            self.assertAlmostEqual(w,expected_w,places=9)
+            self.assertAlmostEqual(v,ref[3]*math.cos(eth)+ey*w+cfg.k_x*ex,places=9)
+            self.assertEqual(switching_terms(cfg,method,ex,s1,s2_out),(0.,0.))
+
+    def test_switching_terms_are_logged(self):
+        cfg=Config(path='straight',duration=1.,dt=0.05,dy0=0.5)
+        for method in CONTROLLERS:
+            run=simulate(cfg,method)
+            h=run.history
+            self.assertIn('switch_omega_term',h)
+            self.assertIn('switch_v_term',h)
+            self.assertEqual(len(h['switch_omega_term']),len(h['t']))
+            self.assertLessEqual(np.max(abs(h['switch_omega_term'])),cfg.eta+1e-9)
+            self.assertLessEqual(np.max(abs(h['switch_v_term'])),cfg.eta_x+1e-9)
+
     def test_stationary_aligned_case(self):
         c=Config(path='straight',dx0=0,dy0=0,dtheta_deg=0)
         for method in CONTROLLERS:

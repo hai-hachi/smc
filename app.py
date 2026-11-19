@@ -51,6 +51,14 @@ with st.sidebar:
         lx=st.slider('lambda_x (1/m)',0.,3.,0.6,0.1)
         ks=st.slider('k_s (1/s)',0.1,6.,1.2,0.1)
         kx=st.slider('k_x (1/s)',0.1,4.,0.8,0.1)
+        st.caption('SMC boundary-layer switching (separate from physical speed limits)')
+        use_sat=st.checkbox('Enable sat(s / phi) switching',value=True,
+            help='Disable to compare against the prior proportional-only controller.')
+        eta=st.slider('eta: angular switching strength (rad/s)',0.,3.,0.40,0.05)
+        phi=st.slider('phi: angular surface boundary width',0.01,2.,0.30,0.01)
+        eta_x=st.slider('eta_x: full-SMC ex switching (m/s)',0.,2.,0.25,0.05,
+            help='Only the full one- and two-surface controllers regulate ex with this term.')
+        phi_x=st.slider('phi_x: ex boundary width (m)',0.01,2.,0.30,0.01)
         krho=st.slider('k_rho (1/s)',0.1,3.,0.8,0.1)
         stop=st.slider('Heading stop threshold (deg)',10.,180.,70.,5.)
         guard=st.number_input('Singularity threshold |1+lambda_y ex|',0.001,1.,0.06,0.01)
@@ -75,6 +83,7 @@ cfg=Config(path=path,dx0=dx,dy0=dy,dtheta_deg=dth,
     replan_offset=replan_offset,length=length,
     circle_radius=rad,zigzag_angle_deg=zz_ang,zigzag_leg=zz_leg,zigzag_turns=zz_turns,smooth_radius_min=smooth_min,smooth_radius_max=smooth_max,
     smooth_period=smooth_period,lambda_y=ly,lambda_x=lx,k_s=ks,k_x=kx,k_rho=krho,
+    use_saturation=use_sat,eta=eta,phi=phi,eta_x=eta_x,phi_x=phi_x,
     heading_stop_deg=stop,v_max=vmax,w_max=wmax,a_max=amax,alpha_max=alpha,
     allow_reverse=reverse,slowdown_dist=slowdown,settle_distance=settle_d,
     settle_heading_deg=settle_th,settle_hold=hold,warmup=warmup,singular_guard=guard)
@@ -83,9 +92,11 @@ try:
 except ValueError as exc:
     st.error(str(exc));st.stop()
 
-st.info('The **truncated** laws deliberately use ωR = 0 and omit the 1 + λy ex denominator. '
-    'The **full** laws include ωR = vR κ and the nonlinear denominator; singularities are reported, not hidden. '
-    '**None of the four includes an SMC saturation or sign switching term.** Physical speed clamps remain.')
+st.info('The **truncated** laws deliberately omit omegaR and the full-law nonlinear denominator. '
+    'The **full** laws include curvature feedforward and a singularity guard. '
+    '**Boundary-layer switching is ' + ('ON' if cfg.use_saturation else 'OFF') + '**: '
+    'angular switching = eta * sat(s / phi); full laws also regulate ex with eta_x * sat(ex / phi_x). '
+    'Physical speed/acceleration clamps remain separate.')
 st.warning('The PP-circle target depends on the robot. Nominal vR and omegaR are feedforward, not the carrot\'s actual velocities. At sharp zigzag corners, the three-point window estimates a finite effective curvature even though exact curvature is undefined.')
 
 
@@ -195,7 +206,12 @@ with tab_cmd:
     st.plotly_chart(lines(runs,['v','omega','desired_v','desired_omega'],['Applied linear speed','Applied angular speed','Unclamped requested linear speed','Unclamped requested angular speed'],['m/s','rad/s','m/s','rad/s']),use_container_width=True)
 with tab_slide:
     st.caption('For the one-surface full law: s1 = eθ + λy ey + λx ex. For two-surface full law: s1 = ex, s2 = eθ + λy ey. Truncated versions show s2 only.')
-    st.plotly_chart(lines(runs,['s1','s2','denom'],['Sliding variable s1','Sliding variable s2','1 + λy ex denominator'],['mixed','mixed','-']),use_container_width=True)
+    st.plotly_chart(lines(runs,['s1','s2','denom','switch_omega_term','switch_v_term'],
+        ['Sliding variable s1','Sliding variable s2','1 + lambda_y ex denominator',
+         'Angular switching numerator term','Longitudinal ex switching term'],
+        ['mixed','mixed','-','rad/s','m/s']),use_container_width=True)
+    st.caption('Angular switching term is shown before division by the full-law denominator D. '
+        'The one-surface full controller also couples the ex switching term into its angular numerator.')
 with tab_ref:
     st.caption('Actual geometric target rates are finite differences of consecutive carrot positions/headings. '
         'The full SMC formulas currently receive **nominal** vR and omegaR, NOT these measured target rates.')
