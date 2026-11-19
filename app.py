@@ -8,6 +8,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
 from smc_lab.core import Config, CONTROLLERS, PATHS, CASES, make_path, make_replanned_path, simulate, batch
+from smc_lab.phase import PHASE_PLANES, phase_portrait
 
 st.set_page_config(page_title='SMC | Control Laboratory', page_icon='🧭', layout='wide')
 st.markdown('''<style>
@@ -182,7 +183,7 @@ st.download_button('Download current metrics CSV',data=results.to_csv(index=Fals
 
 names=[r.controller for r in runs]
 st.markdown('### Time histories')
-tab_error,tab_cmd,tab_slide,tab_ref=st.tabs(['Tracking errors','Velocity commands','Sliding surfaces','Reference / geometry'])
+tab_error,tab_cmd,tab_slide,tab_ref,tab_phase=st.tabs(['Tracking errors','Velocity commands','Sliding surfaces','Reference / geometry','Phase portraits'])
 
 def lines(runset,series,labels,units):
     fig=make_subplots(rows=len(series),cols=1,shared_xaxes=True,vertical_spacing=0.08,
@@ -224,6 +225,97 @@ with tab_ref:
          'Curvature estimated/known at reference','Euclidean robot–carrot distance',
          'Reference path arc position'],
         ['m/s','rad/s','m/s','rad/s','m/s','1/m','m','m']),use_container_width=True)
+
+
+with tab_phase:
+    st.caption('Phase portraits show how each **simulated controller trajectory** moves through error/state space. '
+        'Start = circle, end = X, arrows = direction of time. These are observed trajectories, not a vector field or a stability proof.')
+    plane = st.selectbox('Phase plane', PHASE_PLANES, key='smc_phase_plane')
+    arrows = st.checkbox('Show progression arrows', True, key='smc_phase_arrows')
+    ideal = st.checkbox('Show ideal sliding reaching law', False, key='smc_phase_ideal',
+        disabled=(plane != 'Angular sliding surface vs rate'),
+        help='The theoretical ds/dt = -ks*s - eta*sat(s/phi); not generally the true derivative of the PP carrot tracking error.')
+    portrait = go.Figure()
+    palette = ['#636efa', '#ef553b', '#00cc96', '#ab63fa']
+    rendered = 0
+    for index, r in enumerate(runs):
+        data = phase_portrait(r.history, r.controller, plane)
+        xx, yy, tt = data['x'], data['y'], data['t']
+        if len(xx) == 0:
+            continue
+        color = palette[CONTROLLERS.index(r.controller) % len(palette)]
+        boundaries = np.r_[0, np.flatnonzero(data['break_before']), len(xx)]
+        for j, (lo, hi) in enumerate(zip(boundaries[:-1], boundaries[1:])):
+            if hi <= lo: continue
+            valid = np.isfinite(xx[lo:hi]) & np.isfinite(yy[lo:hi])
+            if not np.any(valid): continue
+            portrait.add_trace(go.Scattergl(
+                x=np.where(valid, xx[lo:hi], np.nan),
+                y=np.where(valid, yy[lo:hi], np.nan),
+                customdata=tt[lo:hi], mode='lines',
+                line=dict(width=2.5, color=color),
+                name=r.controller, legendgroup=r.controller, showlegend=(j==0),
+                hovertemplate='x=%{x:.3f}<br>y=%{y:.3f}<br>t=%{customdata:.2f} s<extra>%{fullData.name}</extra>'))
+            rendered += 1
+            if arrows and hi-lo > 2:
+                # Use arrows in DATA coordinates, so their tips indicate actual
+                # phase trajectory progression, including differing axis scales.
+                for k in np.unique(np.linspace(lo+1, hi-1, min(7, hi-lo-1), dtype=int)):
+                    previous = max(lo, k - max(1, (hi-lo)//75))
+                    if not (np.isfinite(xx[k]) and np.isfinite(yy[k]) and
+                            np.isfinite(xx[previous]) and np.isfinite(yy[previous])):
+                        continue
+                    if math.hypot(xx[k]-xx[previous], yy[k]-yy[previous]) < 1e-9:
+                        continue
+                    portrait.add_annotation(x=float(xx[k]), y=float(yy[k]),
+                        ax=float(xx[previous]), ay=float(yy[previous]),
+                        xref='x', yref='y', axref='x', ayref='y',
+                        showarrow=True, arrowhead=2, arrowsize=1, arrowwidth=1.5,
+                        arrowcolor=color, opacity=0.85)
+        for which, symbol, size in ((0, 'circle-open', 12), (-1, 'x', 11)):
+            if np.isfinite(xx[which]) and np.isfinite(yy[which]):
+                portrait.add_trace(go.Scatter(
+                    x=[xx[which]], y=[yy[which]], mode='markers',
+                    marker=dict(symbol=symbol, size=size, color=color, line=dict(width=2,color=color)),
+                    name=('Start' if which==0 else 'End') + ': ' + r.controller,
+                    legendgroup=r.controller, showlegend=False,
+                    hovertemplate=('Start' if which==0 else 'End') +
+                        '<br>x=%{x:.3f}<br>y=%{y:.3f}<extra>%{fullData.name}</extra>'))
+    portrait.add_hline(y=0, line_width=1, line_dash='dot', line_color='#8993a5')
+    portrait.add_vline(x=0, line_width=1, line_dash='dot', line_color='#8993a5')
+    if plane == 'Angular sliding surface vs rate':
+        portrait.add_vrect(x0=-cfg.phi, x1=cfg.phi, fillcolor='#6b7280',
+            opacity=0.09, line_width=0,
+            annotation_text='Boundary layer ±φ', annotation_position='top left')
+        if ideal and rendered:
+            magnitude = max((float(np.nanmax(np.abs(phase_portrait(r.history, r.controller, plane)['x'])))
+                             for r in runs if len(r.history['t'])), default=1.)
+            values = np.linspace(-max(magnitude, cfg.phi), max(magnitude, cfg.phi), 250)
+            predicted = -cfg.k_s * values
+            if cfg.use_saturation:
+                predicted = predicted - cfg.eta * np.clip(values / cfg.phi, -1., 1.)
+            portrait.add_trace(go.Scatter(x=values, y=predicted, mode='lines',
+                line=dict(color='#666', width=2, dash='dash'),
+                name='Ideal reaching law (not PP target dynamics)'))
+    portrait.update_layout(height=590, margin=dict(l=15,r=15,b=15,t=20),
+        xaxis_title=data['x_label'] if rendered else 'Phase X',
+        yaxis_title=data['y_label'] if rendered else 'Phase Y',
+        legend=dict(orientation='h',y=-0.18), hovermode='closest')
+    st.plotly_chart(portrait, use_container_width=True)
+    if not rendered:
+        st.info('No valid phase samples: the selected controller may have stopped at initialization.')
+    if 'rate' in plane.lower():
+        st.caption('Observed rates are numerical time derivatives of simulated histories. '
+            'A path replan can jump the carrot, so derivatives crossing the update are omitted; '
+            'wrapped heading is unwrapped before differentiation. Sharp corners can still create abrupt changes.')
+    if plane == 'Angular sliding surface vs rate':
+        st.caption('Truncated controllers and full two-surface SMC use s = eθ + λy ey; '
+            'full one-surface SMC uses s = eθ + λy ey + λx ex. '
+            'The gray band shows |s| <= φ. Because the reference is a PP carrot, the ideal reaching law '
+            'is a conceptual comparison, not a guaranteed trajectory.')
+    if plane == 'Lateral error vs heading error':
+        st.caption('Because the target is a positive-lookahead carrot, the phase origin need not be the '
+            'equilibrium of geometric path following. Compare trajectories with path RMSE as well.')
 
 with st.expander('Download full data and save/replay comparison'):
     all_hist=[]

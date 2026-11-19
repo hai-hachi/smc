@@ -135,3 +135,24 @@ The app overlays 2D trajectories, allows PP circle inspection and a mid-run path
 This models ideal differential-drive **kinematics**, not Gazebo, ROS 2, Nav2, wheel-slip, drivetrain dynamics, motor PID or state-estimation error. All variants use the **same** reference and physical velocity/acceleration clamps for a fair comparison. If `allow_reverse` is false, velocity commands are clamped to forward-only. Low-level acceleration limiting starts from zero speed, which introduces transient tracking error. Path RMSE is based on closest geometric path distance, not reference pose distance.
 
 The one-surface full controller guarantees only convergence of its **combined** sliding variable in the ideal nonsingular unsaturated model; it does not by itself establish that all three individual errors converge. Avoid comparing `s=0` with `ex=ey=eθ=0` without analyzing the zero dynamics.
+
+## Phase portraits (Streamlit)
+
+The **Phase portraits** tab plots sampled controller trajectories in state/error
+space, rather than against time. Select a plane to compare all enabled controllers:
+
+- `ey` versus `eθ` (lateral and heading error; default)
+- `ex` versus `ey` (longitudinal and lateral error)
+- `eθ` versus observed `deθ/dt`
+- angular sliding surface `s` versus observed `ds/dt` (with the `±phi` boundary layer)
+- `ex` versus observed `dex/dt`
+
+The full **one-surface** controller uses `s1 = eθ + lambda_y*ey + lambda_x*ex`;
+other variants use `s2 = eθ + lambda_y*ey`. Phase plots mark starts, ends,
+and optional arrows showing motion through the plane. They split at path updates
+and heading wrap discontinuities. Numerical derivatives unwrap heading first,
+and omit finite differences across the exact replanning boundary. A dashed
+`ds/dt = -ks*s - eta*sat(s/phi)` curve may be displayed for comparison, but
+is an **ideal reaching-law prediction**, not a valid stability conclusion for
+a robot-dependent PP carrot. Convergence of the angular surface to zero does
+not imply that geometric path tracking or all three pose errors converge.
